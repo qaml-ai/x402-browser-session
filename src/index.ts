@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
+import { stripeApiKeyMiddleware } from "x402-stripe";
 import { extractParams } from "x402-ai";
 import { openapiFromMiddleware } from "x402-openapi";
 import puppeteer, { type Browser, type Page } from "@cloudflare/puppeteer";
@@ -261,11 +262,40 @@ const ROUTES = {
   },
 };
 
-app.use(
-  cdpPaymentMiddleware((env) => ({
+app.use(stripeApiKeyMiddleware({ serviceName: "browser-session" }));
+
+app.use(async (c, next) => {
+  if (c.get("skipX402")) return next();
+  return cdpPaymentMiddleware((env) => ({
     "POST /": { ...ROUTES["POST /"], accepts: [{ ...ROUTES["POST /"].accepts[0], payTo: env.SERVER_ADDRESS as `0x${string}` }] },
-  }))
-);
+    "POST /session": {
+      accepts: [{ scheme: "exact", price: "$0.02", network: "eip155:8453", payTo: env.SERVER_ADDRESS as `0x${string}` }],
+      description: "Create a browser session and get a CDP websocket endpoint. No input needed — just pay and connect with Puppeteer/Playwright.",
+      mimeType: "application/json",
+    },
+  }))(c, next);
+});
+
+// Create a session — no input, just returns CDP websocket endpoint
+app.post("/session", async (c) => {
+  const { id, stub } = newSessionId(c.env);
+  const doResp = await stub.fetch("https://do.internal/launch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  const launch = await doResp.json<any>();
+
+  // Get the CDP websocket endpoint
+  const connectResp = await stub.fetch("https://do.internal/connect", { method: "POST" });
+  const connect = await connectResp.json<any>();
+
+  return c.json({
+    session_id: id.toString(),
+    created_at: launch.created_at,
+    ws_endpoint: connect.ws_endpoint,
+  });
+});
 
 app.post("/", async (c) => {
   const body = await c.req.json<{ input?: string }>();
@@ -373,7 +403,8 @@ app.get("/", (c) => {
     description: 'Pay-per-action headless browser automation. Send POST / with {"input": "create a browser session and navigate to https://example.com"}',
     price: "$0.02 per request (Base mainnet)",
     endpoints: {
-      "POST /": "$0.02",
+      "POST /session": "$0.02 — create a session, returns CDP websocket endpoint for Puppeteer/Playwright",
+      "POST /": "$0.02 — natural language actions (navigate, screenshot, click, type, close)",
       "DELETE /session/:id": "free — close the session",
     },
   });
